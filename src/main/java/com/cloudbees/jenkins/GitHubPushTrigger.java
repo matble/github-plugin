@@ -11,14 +11,16 @@ import hudson.model.Action;
 import hudson.model.Item;
 import hudson.model.Job;
 import hudson.model.Project;
+import hudson.triggers.SCMTrigger;
 import hudson.triggers.Trigger;
 import hudson.triggers.TriggerDescriptor;
 import hudson.util.FormValidation;
+import hudson.util.NamingThreadFactory;
 import hudson.util.SequentialExecutionQueue;
 import hudson.util.StreamTaskListener;
 import jenkins.model.Jenkins;
-import jenkins.model.Jenkins.MasterComputer;
 import jenkins.model.ParameterizedJobMixIn;
+import jenkins.scm.api.SCMEvent;
 import jenkins.triggers.SCMTriggerItem.SCMTriggerItems;
 import org.apache.commons.jelly.XMLOutput;
 import org.jenkinsci.plugins.github.GitHubPlugin;
@@ -26,8 +28,12 @@ import org.jenkinsci.plugins.github.admin.GitHubHookRegisterProblemMonitor;
 import org.jenkinsci.plugins.github.config.GitHubPluginConfig;
 import org.jenkinsci.plugins.github.internal.GHPluginConfigException;
 import org.jenkinsci.plugins.github.migration.Migrator;
+import org.jenkinsci.Symbol;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.Stapler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -43,9 +49,10 @@ import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 
 import static org.apache.commons.lang3.StringUtils.isEmpty;
-import static org.jenkinsci.plugins.github.Messages.github_trigger_check_method_warning_details;
 import static org.jenkinsci.plugins.github.util.JobInfoHelpers.asParameterizedJobMixIn;
 
 /**
@@ -64,15 +71,30 @@ public class GitHubPushTrigger extends Trigger<Job<?, ?>> implements GitHubTrigg
      */
     @Deprecated
     public void onPost() {
-        onPost("");
+        onPost(GitHubTriggerEvent.create()
+                .build()
+        );
     }
 
     /**
      * Called when a POST is made.
      */
     public void onPost(String triggeredByUser) {
-        final String pushBy = triggeredByUser;
-        getDescriptor().queue.execute(new Runnable() {
+        onPost(GitHubTriggerEvent.create()
+                .withOrigin(SCMEvent.originOf(Stapler.getCurrentRequest()))
+                .withTriggeredByUser(triggeredByUser)
+                .build()
+        );
+    }
+
+    /**
+     * Called when a POST is made.
+     */
+    public void onPost(final GitHubTriggerEvent event) {
+        final String pushBy = event.getTriggeredByUser();
+        DescriptorImpl d = getDescriptor();
+        d.checkThreadPoolSizeAndUpdateIfNecessary();
+        d.queue.execute(new Runnable() {
             private boolean runPolling() {
                 try {
                     StreamTaskListener listener = new StreamTaskListener(getLogFile());
@@ -81,6 +103,9 @@ public class GitHubPushTrigger extends Trigger<Job<?, ?>> implements GitHubTrigg
                         PrintStream logger = listener.getLogger();
                         long start = System.currentTimeMillis();
                         logger.println("Started on " + DateFormat.getDateTimeInstance().format(new Date()));
+                        if (event.getOrigin() != null) {
+                            logger.format("Started by event from %s on %tc%n", event.getOrigin(), event.getTimestamp());
+                        }
                         boolean result = SCMTriggerItems.asSCMTriggerItem(job).poll(listener).hasChanges();
                         logger.println("Done. Took " + Util.getTimeSpanString(System.currentTimeMillis() - start));
                         if (result) {
@@ -108,7 +133,6 @@ public class GitHubPushTrigger extends Trigger<Job<?, ?>> implements GitHubTrigg
 
             public void run() {
                 if (runPolling()) {
-                    String name = " #" + job.getNextBuildNumber();
                     GitHubPushCause cause;
                     try {
                         cause = new GitHubPushCause(getLogFile(), pushBy);
@@ -117,9 +141,10 @@ public class GitHubPushTrigger extends Trigger<Job<?, ?>> implements GitHubTrigg
                         cause = new GitHubPushCause(pushBy);
                     }
                     if (asParameterizedJobMixIn(job).scheduleBuild(cause)) {
-                        LOGGER.info("SCM changes detected in " + job.getName() + ". Triggering " + name);
+                        LOGGER.info("SCM changes detected in " + job.getFullName()
+                                + ". Triggering #" + job.getNextBuildNumber());
                     } else {
-                        LOGGER.info("SCM changes detected in " + job.getName() + ". Job is already in the queue");
+                        LOGGER.info("SCM changes detected in " + job.getFullName() + ". Job is already in the queue");
                     }
                 }
             }
@@ -224,9 +249,10 @@ public class GitHubPushTrigger extends Trigger<Job<?, ?>> implements GitHubTrigg
     }
 
     @Extension
+    @Symbol("githubPush")
     public static class DescriptorImpl extends TriggerDescriptor {
         private final transient SequentialExecutionQueue queue =
-                new SequentialExecutionQueue(MasterComputer.threadPoolForRemoting);
+                new SequentialExecutionQueue(Executors.newSingleThreadExecutor(threadFactory()));
 
         private transient String hookUrl;
 
@@ -234,6 +260,32 @@ public class GitHubPushTrigger extends Trigger<Job<?, ?>> implements GitHubTrigg
 
         @Inject
         private transient GitHubHookRegisterProblemMonitor monitor;
+
+        @Inject
+        private transient SCMTrigger.DescriptorImpl scmTrigger;
+
+        private transient int maximumThreads = Integer.MIN_VALUE;
+
+        public DescriptorImpl() {
+            checkThreadPoolSizeAndUpdateIfNecessary();
+        }
+
+        /**
+         * Update the {@link java.util.concurrent.ExecutorService} instance.
+         */
+        /*package*/
+        synchronized void checkThreadPoolSizeAndUpdateIfNecessary() {
+            if (scmTrigger != null) {
+                int count = scmTrigger.getPollingThreadCount();
+                if (maximumThreads != count) {
+                    maximumThreads = count;
+                    queue.setExecutors(
+                            (count == 0
+                                    ? Executors.newCachedThreadPool(threadFactory())
+                                    : Executors.newFixedThreadPool(maximumThreads, threadFactory())));
+                }
+            }
+        }
 
         @Override
         public boolean isApplicable(Item item) {
@@ -243,7 +295,7 @@ public class GitHubPushTrigger extends Trigger<Job<?, ?>> implements GitHubTrigg
 
         @Override
         public String getDisplayName() {
-            return "Build when a change is pushed to GitHub";
+            return "GitHub hook trigger for GITScm polling";
         }
 
         /**
@@ -289,7 +341,7 @@ public class GitHubPushTrigger extends Trigger<Job<?, ?>> implements GitHubTrigg
             try {
                 return new URL(hookUrl);
             } catch (MalformedURLException e) {
-                LOGGER.warn("Mailformed hook url skipped while migration ({})", e.getMessage());
+                LOGGER.warn("Malformed hook url skipped while migration ({})", e.getMessage());
                 return null;
             }
         }
@@ -333,25 +385,30 @@ public class GitHubPushTrigger extends Trigger<Job<?, ?>> implements GitHubTrigg
             return ALLOW_HOOKURL_OVERRIDE;
         }
 
+        private static ThreadFactory threadFactory() {
+            return new NamingThreadFactory(Executors.defaultThreadFactory(), "GitHubPushTrigger");
+        }
+
         /**
-         * Checks that repo defined in this job is not in administrative monitor as failed to be registered.
+         * Checks that repo defined in this item is not in administrative monitor as failed to be registered.
          * If that so, shows warning with some instructions
          *
-         * @param job - to check against. Should be not null and have at least one repo defined
+         * @param item - to check against. Should be not null and have at least one repo defined
          *
          * @return warning or empty string
-         * @since TODO
+         * @since 1.17.0
          */
         @SuppressWarnings("unused")
-        public FormValidation doCheckHookRegistered(@AncestorInPath Job<?, ?> job) {
-            Preconditions.checkNotNull(job, "Job can't be null if wants to check hook in monitor");
+        @Restricted(NoExternalUse.class) // invoked from Stapler
+        public FormValidation doCheckHookRegistered(@AncestorInPath Item item) {
+            Preconditions.checkNotNull(item, "Item can't be null if wants to check hook in monitor");
 
-            Collection<GitHubRepositoryName> repos = GitHubRepositoryNameContributor.parseAssociatedNames(job);
+            Collection<GitHubRepositoryName> repos = GitHubRepositoryNameContributor.parseAssociatedNames(item);
 
             for (GitHubRepositoryName repo : repos) {
                 if (monitor.isProblemWith(repo)) {
                     return FormValidation.warning(
-                            github_trigger_check_method_warning_details(
+                            org.jenkinsci.plugins.github.Messages.github_trigger_check_method_warning_details(
                                     repo.getUserName(), repo.getRepositoryName(), repo.getHost()
                             ));
                 }

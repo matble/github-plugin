@@ -3,15 +3,21 @@ package org.jenkinsci.plugins.github.webhook.subscriber;
 import com.cloudbees.jenkins.GitHubPushTrigger;
 import com.cloudbees.jenkins.GitHubRepositoryName;
 import com.cloudbees.jenkins.GitHubRepositoryNameContributor;
-import com.cloudbees.jenkins.GitHubTrigger;
+import com.cloudbees.jenkins.GitHubTriggerEvent;
 import com.cloudbees.jenkins.GitHubWebHook;
 import hudson.Extension;
-import hudson.model.Job;
+import hudson.ExtensionList;
+import hudson.model.Item;
 import hudson.security.ACL;
+import java.io.IOException;
+import java.io.StringReader;
+import java.net.URL;
 import jenkins.model.Jenkins;
-import net.sf.json.JSONObject;
+import org.jenkinsci.plugins.github.extension.GHSubscriberEvent;
 import org.jenkinsci.plugins.github.extension.GHEventsSubscriber;
 import org.kohsuke.github.GHEvent;
+import org.kohsuke.github.GHEventPayload;
+import org.kohsuke.github.GitHub;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,7 +47,7 @@ public class DefaultPushGHEventSubscriber extends GHEventsSubscriber {
      * @return true if project has {@link GitHubPushTrigger}
      */
     @Override
-    protected boolean isApplicable(Job<?, ?> project) {
+    protected boolean isApplicable(Item project) {
         return withTrigger(GitHubPushTrigger.class).apply(project);
     }
 
@@ -57,16 +63,20 @@ public class DefaultPushGHEventSubscriber extends GHEventsSubscriber {
      * Calls {@link GitHubPushTrigger} in all projects to handle this hook
      *
      * @param event   only PUSH event
-     * @param payload payload of gh-event. Never blank
      */
     @Override
-    protected void onEvent(GHEvent event, String payload) {
-        JSONObject json = JSONObject.fromObject(payload);
-        String repoUrl = json.getJSONObject("repository").getString("url");
-        final String pusherName = json.getJSONObject("pusher").getString("name");
-
-        LOGGER.info("Received POST for {}", repoUrl);
-        final GitHubRepositoryName changedRepository = GitHubRepositoryName.create(repoUrl);
+    protected void onEvent(final GHSubscriberEvent event) {
+        GHEventPayload.Push push;
+        try {
+            push = GitHub.offline().parseEventPayload(new StringReader(event.getPayload()), GHEventPayload.Push.class);
+        } catch (IOException e) {
+            LOGGER.warn("Received malformed PushEvent: " + event.getPayload(), e);
+            return;
+        }
+        URL repoUrl = push.getRepository().getUrl();
+        final String pusherName = push.getPusher().getName();
+        LOGGER.info("Received PushEvent for {} from {}", repoUrl, event.getOrigin());
+        final GitHubRepositoryName changedRepository = GitHubRepositoryName.create(repoUrl.toExternalForm());
 
         if (changedRepository != null) {
             // run in high privilege to see all the projects anonymous users don't see.
@@ -75,24 +85,30 @@ public class DefaultPushGHEventSubscriber extends GHEventsSubscriber {
             ACL.impersonate(ACL.SYSTEM, new Runnable() {
                 @Override
                 public void run() {
-                    for (Job<?, ?> job : Jenkins.getInstance().getAllItems(Job.class)) {
-                        GitHubTrigger trigger = triggerFrom(job, GitHubPushTrigger.class);
+                    for (Item job : Jenkins.getInstance().getAllItems(Item.class)) {
+                        GitHubPushTrigger trigger = triggerFrom(job, GitHubPushTrigger.class);
                         if (trigger != null) {
-                            LOGGER.debug("Considering to poke {}", job.getFullDisplayName());
-                            if (GitHubRepositoryNameContributor.parseAssociatedNames(job).contains(changedRepository)) {
-                                LOGGER.info("Poked {}", job.getFullDisplayName());
-                                trigger.onPost(pusherName);
+                            String fullDisplayName = job.getFullDisplayName();
+                            LOGGER.debug("Considering to poke {}", fullDisplayName);
+                            if (GitHubRepositoryNameContributor.parseAssociatedNames(job)
+                                    .contains(changedRepository)) {
+                                LOGGER.info("Poked {}", fullDisplayName);
+                                trigger.onPost(GitHubTriggerEvent.create()
+                                        .withTimestamp(event.getTimestamp())
+                                        .withOrigin(event.getOrigin())
+                                        .withTriggeredByUser(pusherName)
+                                        .build()
+                                );
                             } else {
                                 LOGGER.debug("Skipped {} because it doesn't have a matching repository.",
-                                        job.getFullDisplayName());
+                                        fullDisplayName);
                             }
                         }
                     }
                 }
             });
 
-            for (GitHubWebHook.Listener listener : Jenkins.getInstance()
-                    .getExtensionList(GitHubWebHook.Listener.class)) {
+            for (GitHubWebHook.Listener listener : ExtensionList.lookup(GitHubWebHook.Listener.class)) {
                 listener.onPushRepositoryChanged(pusherName, changedRepository);
             }
 

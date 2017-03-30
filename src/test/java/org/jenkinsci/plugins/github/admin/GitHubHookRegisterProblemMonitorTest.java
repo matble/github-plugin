@@ -3,7 +3,9 @@ package org.jenkinsci.plugins.github.admin;
 import com.cloudbees.jenkins.GitHubPushTrigger;
 import com.cloudbees.jenkins.GitHubRepositoryName;
 import hudson.model.FreeStyleProject;
+import hudson.model.Item;
 import hudson.plugins.git.GitSCM;
+import org.jenkinsci.plugins.github.extension.GHSubscriberEvent;
 import org.jenkinsci.plugins.github.extension.GHEventsSubscriber;
 import org.jenkinsci.plugins.github.webhook.WebhookManager;
 import org.jenkinsci.plugins.github.webhook.WebhookManagerTest;
@@ -148,7 +150,7 @@ public class GitHubHookRegisterProblemMonitorTest {
         job.setScm(REPO_GIT_SCM);
 
         WebhookManager.forHookUrl(WebhookManagerTest.HOOK_ENDPOINT)
-                .registerFor(job).run();
+                .registerFor((Item) job).run();
 
         assertThat("should reg problem", monitor.isProblemWith(REPO), is(true));
     }
@@ -165,7 +167,7 @@ public class GitHubHookRegisterProblemMonitorTest {
     public void shouldResolveOnPingHook() {
         monitor.registerProblem(REPO_FROM_PING_PAYLOAD, new IOException());
 
-        GHEventsSubscriber.processEvent(GHEvent.PING, classpath("payloads/ping.json")).apply(pingSubscr);
+        GHEventsSubscriber.processEvent(new GHSubscriberEvent("shouldResolveOnPingHook", GHEvent.PING, classpath("payloads/ping.json"))).apply(pingSubscr);
 
         assertThat("ping resolves problem", monitor.isProblemWith(REPO_FROM_PING_PAYLOAD), is(false));
     }

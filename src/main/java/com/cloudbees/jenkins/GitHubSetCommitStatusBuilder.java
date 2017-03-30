@@ -1,5 +1,6 @@
 package com.cloudbees.jenkins;
 
+import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import hudson.FilePath;
 import hudson.Launcher;
@@ -9,27 +10,33 @@ import hudson.model.TaskListener;
 import hudson.tasks.BuildStepDescriptor;
 import hudson.tasks.Builder;
 import jenkins.tasks.SimpleBuildStep;
-
-import org.eclipse.jgit.lib.ObjectId;
 import org.jenkinsci.plugins.github.common.ExpandableMessage;
-import org.jenkinsci.plugins.github.util.BuildDataHelper;
+import org.jenkinsci.plugins.github.extension.status.GitHubStatusContextSource;
+import org.jenkinsci.plugins.github.extension.status.StatusErrorHandler;
+import org.jenkinsci.plugins.github.extension.status.misc.ConditionalResult;
+import org.jenkinsci.plugins.github.status.GitHubCommitStatusSetter;
+import org.jenkinsci.plugins.github.status.err.ShallowAnyErrorHandler;
+import org.jenkinsci.plugins.github.status.sources.AnyDefinedRepositorySource;
+import org.jenkinsci.plugins.github.status.sources.BuildDataRevisionShaSource;
+import org.jenkinsci.plugins.github.status.sources.ConditionalStatusResultSource;
+import org.jenkinsci.plugins.github.status.sources.DefaultCommitContextSource;
 import org.kohsuke.github.GHCommitState;
-import org.kohsuke.github.GHRepository;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 
 import java.io.IOException;
+import java.util.Collections;
 
-import static com.cloudbees.jenkins.Messages.GitHubCommitNotifier_SettingCommitStatus;
-import static com.coravy.hudson.plugins.github.GithubProjectProperty.displayNameFor;
 import static com.google.common.base.Objects.firstNonNull;
 import static org.apache.commons.lang3.StringUtils.defaultIfEmpty;
+import static org.jenkinsci.plugins.github.status.sources.misc.AnyBuildResult.onAnyResult;
 
 @Extension
 public class GitHubSetCommitStatusBuilder extends Builder implements SimpleBuildStep {
     private static final ExpandableMessage DEFAULT_MESSAGE = new ExpandableMessage("");
 
     private ExpandableMessage statusMessage = DEFAULT_MESSAGE;
+    private GitHubStatusContextSource contextSource = new DefaultCommitContextSource();
 
     @DataBoundConstructor
     public GitHubSetCommitStatusBuilder() {
@@ -43,6 +50,14 @@ public class GitHubSetCommitStatusBuilder extends Builder implements SimpleBuild
     }
 
     /**
+     * @return Context provider
+     * @since 1.24.0
+     */
+    public GitHubStatusContextSource getContextSource() {
+        return contextSource;
+    }
+
+    /**
      * @since 1.14.1
      */
     @DataBoundSetter
@@ -50,30 +65,44 @@ public class GitHubSetCommitStatusBuilder extends Builder implements SimpleBuild
         this.statusMessage = statusMessage;
     }
 
-    @Override
-    public void perform(Run<?, ?> build,
-                        FilePath workspace,
-                        Launcher launcher,
-                        TaskListener listener) throws InterruptedException, IOException {
-        final String sha1 = ObjectId.toString(BuildDataHelper.getCommitSHA1(build));
-        String message = defaultIfEmpty(
-                firstNonNull(statusMessage, DEFAULT_MESSAGE).expandAll(build, listener),
-                Messages.CommitNotifier_Pending(build.getDisplayName())
-        );
-        String contextName = displayNameFor(build.getParent());
+    /**
+     * @since 1.24.0
+     */
+    @DataBoundSetter
+    public void setContextSource(GitHubStatusContextSource contextSource) {
+        this.contextSource = contextSource;
+    }
 
-        for (GitHubRepositoryName name : GitHubRepositoryNameContributor.parseAssociatedNames(build.getParent())) {
-            for (GHRepository repository : name.resolve()) {
-                listener.getLogger().println(
-                        GitHubCommitNotifier_SettingCommitStatus(repository.getHtmlUrl() + "/commit/" + sha1)
-                );
-                repository.createCommitStatus(sha1,
-                        GHCommitState.PENDING,
-                        build.getAbsoluteUrl(),
-                        message,
-                        contextName);
-            }
+    @Override
+    public void perform(@NonNull Run<?, ?> build,
+                        @NonNull FilePath workspace,
+                        @NonNull Launcher launcher,
+                        @NonNull TaskListener listener) throws InterruptedException, IOException {
+
+        GitHubCommitStatusSetter setter = new GitHubCommitStatusSetter();
+        setter.setReposSource(new AnyDefinedRepositorySource());
+        setter.setCommitShaSource(new BuildDataRevisionShaSource());
+        setter.setContextSource(contextSource);
+        setter.setErrorHandlers(Collections.<StatusErrorHandler>singletonList(new ShallowAnyErrorHandler()));
+
+        setter.setStatusResultSource(new ConditionalStatusResultSource(
+                Collections.<ConditionalResult>singletonList(
+                        onAnyResult(
+                                GHCommitState.PENDING,
+                                defaultIfEmpty(firstNonNull(statusMessage, DEFAULT_MESSAGE).getContent(),
+                                        Messages.CommitNotifier_Pending(build.getDisplayName()))
+                        )
+                )));
+
+        setter.perform(build, workspace, launcher, listener);
+    }
+
+
+    public Object readResolve() {
+        if (getContextSource() == null) {
+            setContextSource(new DefaultCommitContextSource());
         }
+        return this;
     }
 
     @Extension

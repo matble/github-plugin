@@ -57,11 +57,11 @@ public class GitHubSetCommitStatusBuilderTest {
 
     @Inject
     public GitHubPluginConfig config;
-    
+
     public JenkinsRule jRule = new JenkinsRule();
 
     @Rule
-    public RuleChain chain = RuleChain.outerRule(jRule).around(new InjectJenkinsMembersRule(jRule, this)); 
+    public RuleChain chain = RuleChain.outerRule(jRule).around(new InjectJenkinsMembersRule(jRule, this));
 
     @Rule
     public GHMockRule github = new GHMockRule(
@@ -77,18 +77,18 @@ public class GitHubSetCommitStatusBuilderTest {
         @Override
         protected void before() throws Throwable {
             when(data.getLastBuiltRevision()).thenReturn(rev);
+            data.lastBuild = new hudson.plugins.git.util.Build(rev, rev, 0, Result.SUCCESS);
             when(rev.getSha1()).thenReturn(ObjectId.fromString(SOME_SHA));
         }
     };
 
     @Test
     @Issue("JENKINS-23641")
-    public void testNoBuildData() throws Exception {
+    public void shouldIgnoreIfNoBuildData() throws Exception {
         FreeStyleProject prj = jRule.createFreeStyleProject("23641_noBuildData");
         prj.getBuildersList().add(new GitHubSetCommitStatusBuilder());
         Build b = prj.scheduleBuild2(0).get();
-        jRule.assertBuildStatus(Result.FAILURE, b);
-        jRule.assertLogContains(org.jenkinsci.plugins.github.util.Messages.BuildDataHelper_NoBuildDataError(), b);
+        jRule.assertBuildStatus(Result.SUCCESS, b);
     }
 
     @Test

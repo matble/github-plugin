@@ -6,11 +6,13 @@ import hudson.Launcher;
 import hudson.model.AbstractBuild;
 import hudson.model.Build;
 import hudson.model.BuildListener;
+import hudson.model.Cause;
 import hudson.model.FreeStyleProject;
 import hudson.model.Result;
 import hudson.plugins.git.GitSCM;
 import hudson.plugins.git.Revision;
 import hudson.plugins.git.util.BuildData;
+import hudson.util.VersionNumber;
 import org.eclipse.jgit.lib.ObjectId;
 import org.jenkinsci.plugins.github.config.GitHubPluginConfig;
 import org.jenkinsci.plugins.github.test.GHMockRule;
@@ -34,6 +36,8 @@ import static com.cloudbees.jenkins.GitHubSetCommitStatusBuilderTest.SOME_SHA;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathMatching;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
+import static org.jenkinsci.plugins.github.util.Messages.BuildDataHelper_NoBuildDataError;
+import static org.jenkinsci.plugins.github.util.Messages.BuildDataHelper_NoLastRevisionError;
 import static org.mockito.Mockito.when;
 
 /**
@@ -73,6 +77,7 @@ public class GitHubCommitNotifierTest {
         @Override
         protected void before() throws Throwable {
             when(data.getLastBuiltRevision()).thenReturn(rev);
+            data.lastBuild = new hudson.plugins.git.util.Build(rev, rev, 0, Result.SUCCESS);
             when(rev.getSha1()).thenReturn(ObjectId.fromString(SOME_SHA));
         }
     };
@@ -84,7 +89,7 @@ public class GitHubCommitNotifierTest {
         prj.getPublishersList().add(new GitHubCommitNotifier());
         Build b = prj.scheduleBuild2(0).get();
         jRule.assertBuildStatus(Result.FAILURE, b);
-        jRule.assertLogContains(org.jenkinsci.plugins.github.util.Messages.BuildDataHelper_NoBuildDataError(), b);
+        jRule.assertLogContains(BuildDataHelper_NoBuildDataError(), b);
     }
 
     @Test
@@ -93,9 +98,10 @@ public class GitHubCommitNotifierTest {
         FreeStyleProject prj = jRule.createFreeStyleProject();
         prj.setScm(new GitSCM("http://non.existent.git.repo.nowhere/repo.git"));
         prj.getPublishersList().add(new GitHubCommitNotifier());
-        Build b = prj.scheduleBuild2(0).get();
+        //Git plugin 2.4.1 + does not include BuildData if checkout fails, so we add it if needed
+        Build b = safelyGenerateBuild(prj);
         jRule.assertBuildStatus(Result.FAILURE, b);
-        jRule.assertLogContains(org.jenkinsci.plugins.github.util.Messages.BuildDataHelper_NoLastRevisionError(), b);
+        jRule.assertLogContains(BuildDataHelper_NoLastRevisionError(), b);
     }
 
     @Test
@@ -134,6 +140,16 @@ public class GitHubCommitNotifierTest {
         prj.scheduleBuild2(0).get();
 
         github.service().verify(1, postRequestedFor(urlPathMatching(".*/" + SOME_SHA)));
+    }
+
+    private Build safelyGenerateBuild(FreeStyleProject prj) throws InterruptedException, java.util.concurrent.ExecutionException {
+        Build b;
+        if (jRule.getPluginManager().getPlugin("git").getVersionNumber().isNewerThan(new VersionNumber("2.4.0"))) {
+            b = prj.scheduleBuild2(0, new Cause.UserIdCause(), new BuildData()).get();
+        } else {
+            b = prj.scheduleBuild2(0).get();
+        }
+        return b;
     }
 
     @TestExtension

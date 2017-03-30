@@ -3,19 +3,25 @@ package com.cloudbees.jenkins;
 import com.google.common.base.Function;
 import hudson.Extension;
 import hudson.ExtensionPoint;
+import hudson.model.Item;
 import hudson.model.Job;
 import hudson.model.RootAction;
 import hudson.model.UnprotectedRootAction;
 import hudson.util.SequentialExecutionQueue;
 import jenkins.model.Jenkins;
+import jenkins.scm.api.SCMEvent;
 import org.apache.commons.lang3.Validate;
 import org.jenkinsci.plugins.github.GitHubPlugin;
+import org.jenkinsci.plugins.github.extension.GHSubscriberEvent;
 import org.jenkinsci.plugins.github.extension.GHEventsSubscriber;
 import org.jenkinsci.plugins.github.internal.GHPluginConfigException;
 import org.jenkinsci.plugins.github.webhook.GHEventHeader;
 import org.jenkinsci.plugins.github.webhook.GHEventPayload;
 import org.jenkinsci.plugins.github.webhook.RequirePostWithGHHookPayload;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.github.GHEvent;
+import org.kohsuke.stapler.Stapler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -70,9 +76,23 @@ public class GitHubWebHook implements UnprotectedRootAction {
      * {@code GitHubWebHook.get().registerHookFor(job);}
      *
      * @param job not null project to register hook for
+     * @deprecated use {@link #registerHookFor(Item)}
      */
+    @Deprecated
     public void registerHookFor(Job job) {
         reRegisterHookForJob().apply(job);
+    }
+
+    /**
+     * If any wants to auto-register hook, then should call this method
+     * Example code:
+     * {@code GitHubWebHook.get().registerHookFor(item);}
+     *
+     * @param item not null item to register hook for
+     * @since 1.25.0
+     */
+    public void registerHookFor(Item item) {
+        reRegisterHookForJob().apply(item);
     }
 
     /**
@@ -80,11 +100,12 @@ public class GitHubWebHook implements UnprotectedRootAction {
      *
      * @return list of jobs which jenkins tried to register hook
      */
-    public List<Job> reRegisterAllHooks() {
-        return from(getJenkinsInstance().getAllItems(Job.class))
+    public List<Item> reRegisterAllHooks() {
+        return from(getJenkinsInstance().getAllItems(Item.class))
                 .filter(isBuildable())
                 .filter(isAlive())
-                .transform(reRegisterHookForJob()).toList();
+                .transform(reRegisterHookForJob())
+                .toList();
     }
 
     /**
@@ -96,16 +117,18 @@ public class GitHubWebHook implements UnprotectedRootAction {
     @SuppressWarnings("unused")
     @RequirePostWithGHHookPayload
     public void doIndex(@Nonnull @GHEventHeader GHEvent event, @Nonnull @GHEventPayload String payload) {
+        GHSubscriberEvent subscriberEvent =
+                new GHSubscriberEvent(SCMEvent.originOf(Stapler.getCurrentRequest()), event, payload);
         from(GHEventsSubscriber.all())
                 .filter(isInterestedIn(event))
-                .transform(processEvent(event, payload)).toList();
+                .transform(processEvent(subscriberEvent)).toList();
     }
 
-    private Function<Job, Job> reRegisterHookForJob() {
-        return new Function<Job, Job>() {
+    private <T extends Item> Function<T, T> reRegisterHookForJob() {
+        return new Function<T, T>() {
             @Override
-            public Job apply(Job job) {
-                LOGGER.debug("Calling registerHooks() for {}", notNull(job, "Job can't be null").getFullName());
+            public T apply(T job) {
+                LOGGER.debug("Calling registerHooks() for {}", notNull(job, "Item can't be null").getFullName());
 
                 // We should handle wrong url of self defined hook url here in any case with try-catch :(
                 URL hookUrl;
@@ -137,7 +160,11 @@ public class GitHubWebHook implements UnprotectedRootAction {
      * Other plugins may be interested in listening for these updates.
      *
      * @since 1.8
+     * @deprecated working theory is that this API is not required any more with the {@link SCMEvent} based API,
+     * if wrong, please raise a JIRA
      */
+    @Deprecated
+    @Restricted(NoExternalUse.class)
     public abstract static class Listener implements ExtensionPoint {
 
         /**
